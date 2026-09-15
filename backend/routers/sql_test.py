@@ -192,6 +192,11 @@ async def test_sql_query(request: SQLTestRequest):
         # Also register combined data as "input" table (for Visual Transform/backward compatibility)
         con.register('input', sample_df)
 
+        # User SQL only needs the registered sample tables. Block file access, COPY/ATTACH and
+        # extension loading, and lock the settings so the query cannot turn them back on.
+        con.execute("SET enable_external_access = false")
+        con.execute("SET lock_configuration = true")
+
         # Execute user's SQL and apply limit
         # For UNION ALL, multiply limit by number of sources to show data from each source
         effective_limit = limit * len(request.sources)
@@ -501,12 +506,14 @@ async def _load_sample_data(
             table_name = source_dataset.get('table')
             # Smart JOIN filtering
             if filter_column and filter_values:
-                values_str = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in filter_values])
-                query = f"SELECT * FROM {table_name} WHERE {filter_column} IN ({values_str}) LIMIT {limit}"
-                print(f"[Smart JOIN] PostgreSQL query: {query[:200]}...")
+                # Bind values instead of formatting them into the SQL (quotes in data broke the query)
+                query = f"SELECT * FROM {table_name} WHERE {filter_column} IN %s LIMIT {limit}"
+                params = (tuple(filter_values),)
+                print(f"[Smart JOIN] PostgreSQL query: {query}")
             else:
                 query = f"SELECT * FROM {table_name} LIMIT {limit}"
-            df = pd.read_sql(query, conn)
+                params = None
+            df = pd.read_sql(query, conn, params=params)
         
         return df
     
@@ -525,12 +532,13 @@ async def _load_sample_data(
         table_name = source_dataset.get('table')
         # Smart JOIN filtering
         if filter_column and filter_values:
-            values_str = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in filter_values])
-            query = f"SELECT * FROM {table_name} WHERE {filter_column} IN ({values_str}) LIMIT {limit}"
-            print(f"[Smart JOIN] MySQL query: {query[:200]}...")
+            query = f"SELECT * FROM {table_name} WHERE {filter_column} IN %s LIMIT {limit}"
+            params = (tuple(filter_values),)
+            print(f"[Smart JOIN] MySQL query: {query}")
         else:
             query = f"SELECT * FROM {table_name} LIMIT {limit}"
-        df = pd.read_sql(query, conn)
+            params = None
+        df = pd.read_sql(query, conn, params=params)
         conn.close()
         
         return df
@@ -704,11 +712,13 @@ async def _load_sample_data(
 
         # Build filter clause for smart JOIN sampling (before query construction)
         filter_clause = ""
+        filter_params = []
         if filter_column and filter_values:
-            # Handle string vs non-string values safely for SQL
-            values_str = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in filter_values])
-            filter_clause = f" WHERE {filter_column} IN ({values_str})"
-            print(f"[Smart JOIN] S3 filter: {filter_clause[:100]}...")
+            # One placeholder per value; DuckDB casts each to the column type like it did for literals
+            placeholders = ", ".join("?" for _ in filter_values)
+            filter_clause = f" WHERE {filter_column} IN ({placeholders})"
+            filter_params = list(filter_values)
+            print(f"[Smart JOIN] S3 filter on {filter_column} with {len(filter_params)} values")
         
         # Build ORDER BY clause for smart JOIN sampling (get smallest values first)
         order_clause = ""
@@ -812,7 +822,7 @@ async def _load_sample_data(
         try:
             # Execute query
              
-            df = con.execute(query).df()
+            df = con.execute(query, filter_params).df()
             
             # Apply filter after loading if filter was specified
             if filter_clause and filter_column and filter_column in df.columns:
