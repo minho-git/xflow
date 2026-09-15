@@ -547,7 +547,13 @@ class QualityService:
                 "_id": "$dataset_id",
                 "latest": {"$first": "$$ROOT"}
             }},
-            {"$replaceRoot": {"newRoot": "$latest"}}
+            {"$replaceRoot": {"newRoot": "$latest"}},
+            # The dashboard only renders these fields. Full documents carry per-column
+            # checks and null_counts, which made the response ~20x larger than needed.
+            {"$project": {
+                "dataset_id": 1, "s3_path": 1, "overall_score": 1,
+                "status": 1, "run_at": 1
+            }}
         ]
         
         latest_results = await QualityResult.aggregate(pipeline).to_list()

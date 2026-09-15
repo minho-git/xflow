@@ -59,3 +59,20 @@ A dataset whose checks stopped early was also tested (latest result far behind t
 entries). The planner picked the `dataset_id` index and examined 10 docs — not a problem.
 
 Existing deployments keep the old `dataset_id_1` / `run_at_1` indexes; Beanie does not drop them.
+
+## Response payload
+
+The dashboard rendered five fields per result, but the aggregation returned whole documents
+(20-column `checks` arrays and `null_counts`). A `$project` stage now returns only
+`dataset_id, s3_path, overall_score, status, run_at`.
+
+`verify_project.py` runs the real service with and without the `$project` stage (1,000 datasets):
+
+| | without `$project` | with `$project` |
+|---|---:|---:|
+| JSON response | 3,175 KB | 223 KB |
+| service + JSON encode (median) | 32.8 ms | 3.9 ms |
+
+The plan stays `FETCH ← DISTINCT_SCAN`, and the `summary` block is identical.
+`job_name` / `domain_id` read by the page are not fields of `QualityResult`, so nothing the page
+receives changes.
