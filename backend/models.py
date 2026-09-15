@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from beanie import Document, Link
 from pydantic import BaseModel, Field
+from pymongo import ASCENDING, DESCENDING, IndexModel
 
 
 class Role(Document):
@@ -289,5 +290,11 @@ class QualityResult(Document):
 
     class Settings:
         name = "quality_results"
-        indexes = ["dataset_id", "run_at"]
+        # Every read is "latest runs of one dataset", so one compound index covers
+        # latest / history / dashboard. The dashboard aggregation must $sort in this
+        # same order to get a DISTINCT_SCAN (one index entry per dataset).
+        indexes = [
+            IndexModel([("dataset_id", ASCENDING), ("run_at", DESCENDING)],
+                       name="dataset_id_run_at_desc"),
+        ]
 

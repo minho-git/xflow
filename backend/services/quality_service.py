@@ -538,9 +538,11 @@ class QualityService:
         Get aggregated quality metrics for the dashboard.
         Returns latest result for every Dataset.
         """
-        # MongoDB Aggregation to get the latest result for each Dataset
+        # MongoDB Aggregation to get the latest result for each Dataset.
+        # Sort key matches the (dataset_id, run_at desc) index so MongoDB reads one
+        # entry per dataset (DISTINCT_SCAN) instead of fetching every result document.
         pipeline = [
-            {"$sort": {"run_at": -1}},
+            {"$sort": {"dataset_id": 1, "run_at": -1}},
             {"$group": {
                 "_id": "$dataset_id",
                 "latest": {"$first": "$$ROOT"}
