@@ -5,6 +5,7 @@ This service runs quality checks on data stored in S3 (LocalStack) and
 stores results in MongoDB for tracking and visualization.
 """
 
+import asyncio
 import os
 import time
 import tempfile
@@ -96,6 +97,97 @@ class QualityService:
             pass
         return total_bytes
 
+    def _scan_parquet(self, bucket: str, parquet_keys: List[str], sample_clause: str):
+        """
+        Blocking DuckDB scan over S3 parquet files. Called via asyncio.to_thread.
+        Returns (table_info, aggregate_row, distinct_row_count).
+        """
+        # [OPTIMIZATION] Direct S3 Read (Streaming)
+        # No download needed. DuckDB reads directly from S3.
+
+        # Create DuckDB connection
+        conn = duckdb.connect(":memory:")
+        try:
+            # Configure S3 for DuckDB
+            conn.execute("INSTALL httpfs; LOAD httpfs;")
+            conn.execute("INSTALL aws; LOAD aws;")
+
+            # Environment-based S3 configuration
+            env = os.getenv("ENVIRONMENT", "local")
+
+            if env == "production":
+                # Production (AWS): Get credentials from boto3 (supports IRSA)
+                import boto3
+                session = boto3.Session()
+                credentials = session.get_credentials()
+
+                # Pass credentials to DuckDB explicitly
+                conn.execute(f"""
+                    SET s3_region='{S3_REGION}';
+                    SET s3_endpoint='s3.{S3_REGION}.amazonaws.com';
+                    SET s3_access_key_id='{credentials.access_key}';
+                    SET s3_secret_access_key='{credentials.secret_key}';
+                    SET s3_session_token='{credentials.token}';
+                    SET s3_use_ssl=true;
+                    SET s3_url_style='path';
+                """)
+            else:
+                # Local (LocalStack): Explicit endpoint and credentials
+                duckdb_endpoint = S3_ENDPOINT.replace("http://", "").replace("https://", "")
+                conn.execute(f"""
+                    SET s3_endpoint='{duckdb_endpoint}';
+                    SET s3_use_ssl=false;
+                    SET s3_url_style='path';
+                    SET s3_region='{S3_REGION}';
+                    SET s3_access_key_id='{S3_ACCESS_KEY}';
+                    SET s3_secret_access_key='{S3_SECRET_KEY}';
+                """)
+
+            # Build query for S3 paths (use all files, TABLESAMPLE handles sampling)
+            s3_target_paths = [f"s3://{bucket}/{k}" for k in parquet_keys]
+
+            # Use union_by_name=True to handle files with different schemas
+            if len(s3_target_paths) == 1:
+                from_clause = f"read_parquet('{s3_target_paths[0]}', union_by_name=True){sample_clause}"
+            else:
+                paths_str = ", ".join([f"'{p}'" for p in s3_target_paths])
+                from_clause = f"read_parquet([{paths_str}], union_by_name=True){sample_clause}"
+
+            # [PERFORMANCE OPTIMIZATION] One-Pass Scan
+            # Instead of running multiple queries, we build a single SQL query
+            # to fetch all necessary statistics (Count, Distinct, Min, Max) at once.
+
+            # 1. Get Schema
+            # "DESCRIBE" reads metadata only (very fast)
+            table_info = conn.execute(f"DESCRIBE SELECT * FROM {from_clause}").fetchall()
+            column_names = [col[0] for col in table_info]
+
+            # 2. Build Aggregation Query
+            # SELECT COUNT(*) as total, COUNT(col1), MIN(col1), MAX(col1), ...
+            # Note: COUNT(DISTINCT *) is not supported in DuckDB, so we use a separate query
+
+            aggs = ["COUNT(*) as total_rows"]
+
+            for col in column_names:
+                c = f'"{col}"'
+                aggs.append(f"COUNT({c})") # Count non-nulls
+                aggs.append(f"MIN({c})")
+                aggs.append(f"MAX({c})")
+
+            query = f"SELECT {', '.join(aggs)} FROM {from_clause}"
+
+            # 3. Execute Query (This is the ONLY heavy scan)
+            row = conn.execute(query).fetchone()
+
+            # 4. Get distinct count via separate query (DuckDB doesn't support COUNT(DISTINCT *))
+            # NOTE: from_clause already includes TABLESAMPLE for large datasets,
+            # so this query also benefits from sampling (10x faster for 500MB+ data)
+            distinct_query = f"SELECT COUNT(*) FROM (SELECT DISTINCT * FROM {from_clause})"
+            distinct_rows = conn.execute(distinct_query).fetchone()[0]
+            return table_info, row, distinct_rows
+        finally:
+            conn.close()
+
     async def run_quality_check(
         self,
         dataset_id: str,
@@ -132,7 +224,7 @@ class QualityService:
                 # Folder - list all parquet files
                 # Handle root bucket case (key is empty)
                 prefix = key.rstrip('/') + '/' if key else ""
-                parquet_keys = self._list_parquet_files(bucket, prefix)
+                parquet_keys = await asyncio.to_thread(self._list_parquet_files, bucket, prefix)
                 
                 if not parquet_keys:
                     result.status = "completed"
@@ -144,7 +236,7 @@ class QualityService:
                     return result
 
             # --- Strategy Selection ---
-            total_size = self._calculate_total_size(bucket, parquet_keys)
+            total_size = await asyncio.to_thread(self._calculate_total_size, bucket, parquet_keys)
             
             # Threshold: 100MB
             # Small files should be full-scanned for accuracy.
@@ -171,57 +263,6 @@ class QualityService:
                 estimated_sample_mb = total_size_mb * (sample_rate / 100)
                 sampling_info = f"Sampling Mode: TABLESAMPLE {sample_rate}% (Total: {total_size_mb:.0f} MB → Sample: ~{estimated_sample_mb:.0f} MB)"
             
-            # [OPTIMIZATION] Direct S3 Read (Streaming)
-            # No download needed. DuckDB reads directly from S3.
-            
-            # Create DuckDB connection
-            conn = duckdb.connect(":memory:")
-            
-            # Configure S3 for DuckDB
-            conn.execute("INSTALL httpfs; LOAD httpfs;")
-            conn.execute("INSTALL aws; LOAD aws;")
-            
-            # Environment-based S3 configuration
-            env = os.getenv("ENVIRONMENT", "local")
-            
-            if env == "production":
-                # Production (AWS): Get credentials from boto3 (supports IRSA)
-                import boto3
-                session = boto3.Session()
-                credentials = session.get_credentials()
-                
-                # Pass credentials to DuckDB explicitly
-                conn.execute(f"""
-                    SET s3_region='{S3_REGION}';
-                    SET s3_endpoint='s3.{S3_REGION}.amazonaws.com';
-                    SET s3_access_key_id='{credentials.access_key}';
-                    SET s3_secret_access_key='{credentials.secret_key}';
-                    SET s3_session_token='{credentials.token}';
-                    SET s3_use_ssl=true;
-                    SET s3_url_style='path';
-                """)
-            else:
-                # Local (LocalStack): Explicit endpoint and credentials
-                duckdb_endpoint = S3_ENDPOINT.replace("http://", "").replace("https://", "")
-                conn.execute(f"""
-                    SET s3_endpoint='{duckdb_endpoint}';
-                    SET s3_use_ssl=false;
-                    SET s3_url_style='path';
-                    SET s3_region='{S3_REGION}';
-                    SET s3_access_key_id='{S3_ACCESS_KEY}';
-                    SET s3_secret_access_key='{S3_SECRET_KEY}';
-                """)
-            
-            # Build query for S3 paths (use all files, TABLESAMPLE handles sampling)
-            s3_target_paths = [f"s3://{bucket}/{k}" for k in parquet_keys]
-            
-            # Use union_by_name=True to handle files with different schemas
-            if len(s3_target_paths) == 1:
-                from_clause = f"read_parquet('{s3_target_paths[0]}', union_by_name=True){sample_clause}"
-            else:
-                paths_str = ", ".join([f"'{p}'" for p in s3_target_paths])
-                from_clause = f"read_parquet([{paths_str}], union_by_name=True){sample_clause}"
-            
             checks = []
 
             # Add sampling info Check if applicable
@@ -237,40 +278,17 @@ class QualityService:
             
             score = 100.0
             
-            # [PERFORMANCE OPTIMIZATION] One-Pass Scan
-            # Instead of running multiple queries, we build a single SQL query
-            # to fetch all necessary statistics (Count, Distinct, Min, Max) at once.
-            
-            # 1. Get Schema
-            # "DESCRIBE" reads metadata only (very fast)
-            table_info = conn.execute(f"DESCRIBE SELECT * FROM {from_clause}").fetchall()
+            # DuckDB and boto3 are blocking. Running the scan directly in this async
+            # handler froze the event loop until it finished, so every other request
+            # on the server waited. Run it in a worker thread instead.
+            table_info, row, distinct_rows = await asyncio.to_thread(
+                self._scan_parquet, bucket, parquet_keys, sample_clause
+            )
             column_names = [col[0] for col in table_info]
             column_types = {col[0]: col[1].upper() for col in table_info}
             
             result.column_count = len(column_names)
             
-            # 2. Build Aggregation Query
-            # SELECT COUNT(*) as total, COUNT(col1), MIN(col1), MAX(col1), ...
-            # Note: COUNT(DISTINCT *) is not supported in DuckDB, so we use a separate query
-            
-            aggs = ["COUNT(*) as total_rows"]
-            
-            for col in column_names:
-                c = f'"{col}"'
-                aggs.append(f"COUNT({c})") # Count non-nulls
-                aggs.append(f"MIN({c})")
-                aggs.append(f"MAX({c})")
-            
-            query = f"SELECT {', '.join(aggs)} FROM {from_clause}"
-            
-            # 3. Execute Query (This is the ONLY heavy scan)
-            row = conn.execute(query).fetchone()
-            
-            # 4. Get distinct count via separate query (DuckDB doesn't support COUNT(DISTINCT *))
-            # NOTE: from_clause already includes TABLESAMPLE for large datasets,
-            # so this query also benefits from sampling (10x faster for 500MB+ data)
-            distinct_query = f"SELECT COUNT(*) FROM (SELECT DISTINCT * FROM {from_clause})"
-            distinct_rows = conn.execute(distinct_query).fetchone()[0]
             
             # 5. Parse Results
             total_rows = row[0]
