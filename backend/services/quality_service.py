@@ -61,19 +61,25 @@ class QualityService:
         key = parts[1] if len(parts) > 1 else ""
         return bucket, key
     
-    def _list_parquet_files(self, bucket: str, prefix: str) -> List[str]:
-        """List all parquet files under a prefix"""
-        files = []
+    def _list_parquet_objects(self, bucket: str, prefix: str) -> List[dict]:
+        """List parquet files under a prefix with their sizes.
+
+        list_objects_v2 already returns Size, so no per-file head_object is needed.
+        """
+        objects = []
         paginator = self.s3_client.get_paginator('list_objects_v2')
-        
+
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get('Contents', []):
-                key = obj['Key']
-                if key.endswith('.parquet'):
-                    files.append(key)
-        
-        return files
-    
+                if obj['Key'].endswith('.parquet'):
+                    objects.append({"key": obj['Key'], "size": obj['Size']})
+
+        return objects
+
+    def _get_object_size(self, bucket: str, key: str) -> int:
+        """Size of a single file. Errors propagate so the check fails instead of skipping sampling."""
+        return self.s3_client.head_object(Bucket=bucket, Key=key)['ContentLength']
+
     def _download_parquet_files(self, bucket: str, keys: List[str]) -> List[str]:
         """Download parquet files to temp directory, return list of local paths"""
         temp_dir = tempfile.mkdtemp()
@@ -86,17 +92,6 @@ class QualityService:
         
         return local_paths
     
-    def _calculate_total_size(self, bucket: str, keys: List[str]) -> int:
-        """Calculate total size of listed files in bytes"""
-        total_bytes = 0
-        try:
-            for key in keys:
-                response = self.s3_client.head_object(Bucket=bucket, Key=key)
-                total_bytes += response['ContentLength']
-        except Exception:
-            pass
-        return total_bytes
-
     def _scan_parquet(self, bucket: str, parquet_keys: List[str], sample_clause: str):
         """
         Blocking DuckDB scan over S3 parquet files. Called via asyncio.to_thread.
@@ -220,13 +215,14 @@ class QualityService:
             if s3_path.endswith('.parquet'):
                 # Single file
                 parquet_keys = [key]
+                total_size = await asyncio.to_thread(self._get_object_size, bucket, key)
             else:
                 # Folder - list all parquet files
                 # Handle root bucket case (key is empty)
                 prefix = key.rstrip('/') + '/' if key else ""
-                parquet_keys = await asyncio.to_thread(self._list_parquet_files, bucket, prefix)
-                
-                if not parquet_keys:
+                objects = await asyncio.to_thread(self._list_parquet_objects, bucket, prefix)
+
+                if not objects:
                     result.status = "completed"
                     result.overall_score = 0.0
                     result.error_message = "No parquet files found"
@@ -235,9 +231,10 @@ class QualityService:
                     await result.save()
                     return result
 
+                parquet_keys = [o["key"] for o in objects]
+                total_size = sum(o["size"] for o in objects)
+
             # --- Strategy Selection ---
-            total_size = await asyncio.to_thread(self._calculate_total_size, bucket, parquet_keys)
-            
             # Threshold: 100MB
             # Small files should be full-scanned for accuracy.
             MB = 1024 * 1024
